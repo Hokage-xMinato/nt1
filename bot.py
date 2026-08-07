@@ -70,6 +70,13 @@ MJ_USER_ID = os.getenv("MJ_USER_ID", "3186295")
 # ── Auth token API ─────────────────────────────────────────────
 AUTH_API_URL = "https://nt-bearer.vercel.app/api"
 
+# ── Delta Study cookie API ──────────────────────────────────────
+DELTA_COOKIE_API  = "https://deltacookie.vercel.app/api/cookie"
+DELTA_API_BASE    = "https://apiserver.deltastudy.site/api/nexttoppers"
+
+# In-memory delta cookie cache  { "cookie": "delta_cf_verified=…", "expires_at": datetime }
+_delta_cookie_cache: dict = {}
+
 # Maps auth-API response keys → platform keys
 # e.g. "nexttoppers-107" → nt,  "missionjeet-151" → mj
 _AUTH_KEY_PLATFORM = {
@@ -510,6 +517,194 @@ def _direct_headers(platform: str) -> dict:
         "user_id": creds["user_id"],
         "version": "1",
     }
+
+
+# ═══════════════════════════════════════════════════════════════
+#  DELTA STUDY  –  Cookie Management
+# ═══════════════════════════════════════════════════════════════
+async def fetch_delta_cookie(session: aiohttp.ClientSession | None = None) -> str | None:
+    """
+    Fetch a fresh delta_cf_verified cookie from the cookie API and cache it.
+    Returns the raw cookie string (e.g. 'delta_cf_verified=…') or None on failure.
+    Uses a passed session if provided, otherwise creates a temporary one.
+    """
+    global _delta_cookie_cache
+    _own_session = session is None
+    try:
+        if _own_session:
+            session = aiohttp.ClientSession()
+        async with session.get(
+            DELTA_COOKIE_API, timeout=aiohttp.ClientTimeout(total=15)
+        ) as r:
+            r.raise_for_status()
+            data = await r.json(content_type=None)
+
+        # Response: {"cookie": ["delta_cf_verified=…; Path=/; …"], "expiresAt": "…", …}
+        cookie_list = data.get("cookie") or []
+        if not cookie_list:
+            log.warning("fetch_delta_cookie: API returned no cookie values")
+            return None
+
+        # Extract just the cookie name=value part (everything before the first ";")
+        raw_cookie = cookie_list[0].split(";")[0].strip()
+
+        expires_at_str = data.get("expiresAt")
+        expires_at = None
+        if expires_at_str:
+            try:
+                expires_at = datetime.datetime.fromisoformat(
+                    expires_at_str.replace("Z", "+00:00")
+                )
+            except Exception:
+                pass
+
+        _delta_cookie_cache = {"cookie": raw_cookie, "expires_at": expires_at}
+        log.info(f"fetch_delta_cookie: refreshed → {raw_cookie[:40]}… expires={expires_at}")
+        return raw_cookie
+
+    except Exception as e:
+        log.error(f"fetch_delta_cookie: failed: {e}")
+        return None
+    finally:
+        if _own_session and session is not None:
+            await session.close()
+
+
+async def _get_delta_cookie(session: aiohttp.ClientSession | None = None) -> str:
+    """
+    Return a valid delta cookie, fetching one if the cache is empty or stale.
+    Raises RuntimeError if unable to obtain a cookie.
+    """
+    cached = _delta_cookie_cache.get("cookie", "")
+    expires_at = _delta_cookie_cache.get("expires_at")
+
+    now_utc = datetime.datetime.now(datetime.timezone.utc)
+    is_expired = (
+        not cached
+        or (expires_at is not None and expires_at <= now_utc + datetime.timedelta(seconds=60))
+    )
+
+    if is_expired:
+        cookie = await fetch_delta_cookie(session)
+        if not cookie:
+            raise RuntimeError("Could not obtain a delta_cf_verified cookie")
+        return cookie
+
+    return cached
+
+
+def _delta_headers(cookie: str) -> dict:
+    """Build HTTP headers for apiserver.deltastudy.site requests."""
+    return {
+        "accept": "application/json, text/plain, */*",
+        "cookie": cookie,
+        "origin": "https://deltastudy.site",
+        "referer": "https://deltastudy.site/",
+        "user-agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/145.0.0.0 Safari/537.36"
+        ),
+    }
+
+
+async def _delta_get(
+    session: aiohttp.ClientSession, path: str, params: dict
+) -> dict | None:
+    """
+    GET https://apiserver.deltastudy.site/api/nexttoppers/<path> with delta cookie.
+    Auto-refreshes the cookie on 403 and retries once.
+    Returns the parsed JSON dict, or None on failure.
+    """
+    url = f"{DELTA_API_BASE}/{path}"
+    for attempt in range(1, 4):
+        try:
+            cookie = await _get_delta_cookie(session)
+            headers = _delta_headers(cookie)
+            async with session.get(
+                url, params=params, headers=headers,
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as r:
+                if r.status == 403:
+                    log.warning(
+                        f"_delta_get {path} attempt {attempt}/3: 403 — refreshing cookie"
+                    )
+                    # Force refresh by clearing cache
+                    _delta_cookie_cache.clear()
+                    if attempt < 3:
+                        await asyncio.sleep(1)
+                        continue
+                    log.error(f"_delta_get {path}: still 403 after cookie refresh")
+                    return None
+                if r.status != 200:
+                    log.warning(f"_delta_get {path} attempt {attempt}/3: HTTP {r.status}")
+                    if attempt < 3:
+                        await asyncio.sleep(2 ** attempt)
+                        continue
+                    return None
+                data = await r.json(content_type=None)
+                return data
+        except Exception as e:
+            log.warning(f"_delta_get {path} attempt {attempt}/3: {e}")
+            if attempt < 3:
+                await asyncio.sleep(2 ** attempt)
+    return None
+
+
+# ═══════════════════════════════════════════════════════════════
+#  DELTA STUDY  –  Content & Video Detail Fetchers
+# ═══════════════════════════════════════════════════════════════
+async def fetch_delta_content_details(
+    session: aiohttp.ClientSession,
+    content_id: int,
+    course_id: int,
+) -> dict | None:
+    """
+    Fetch PDF / video content details from deltastudy.site.
+    Endpoint: GET /api/nexttoppers/content-details?content_id=X&courseid=Y
+    Returns the 'data' dict from the response, or None.
+    """
+    resp = await _delta_get(
+        session,
+        "content-details",
+        params={"content_id": content_id, "courseid": course_id},
+    )
+    if resp is None:
+        return None
+    if not resp.get("success"):
+        log.warning(
+            f"fetch_delta_content_details: content_id={content_id} "
+            f"success=false msg={resp.get('message','')}"
+        )
+        return None
+    return resp.get("data")
+
+
+async def fetch_delta_video_details(
+    session: aiohttp.ClientSession,
+    vdc_id: str,
+) -> dict | None:
+    """
+    Fetch video details from deltastudy.site.
+    Endpoint: GET /api/nexttoppers/video-details?videoid=<vdc_id>
+    Returns the full 'data' dict (which contains file_url, duration,
+    thumbnail, etc.), or None on failure.
+    """
+    resp = await _delta_get(
+        session,
+        "video-details",
+        params={"videoid": vdc_id},
+    )
+    if resp is None:
+        return None
+    if not resp.get("success"):
+        log.warning(
+            f"fetch_delta_video_details: vdc_id={vdc_id} "
+            f"success=false msg={resp.get('message','')}"
+        )
+        return None
+    data = resp.get("data") or {}
+    return data if data else None
 
 
 async def _direct_post(session: aiohttp.ClientSession, platform: str, path: str, body: dict) -> dict:
@@ -1547,7 +1742,7 @@ async def fetch_all_content(
 
 
 # ═══════════════════════════════════════════════════════════════
-#  DIRECT API – CONTENT-DETAILS  (GET to course.nexttoppers.com)
+#  DIRECT API – CONTENT-DETAILS  (Delta Study API)
 # ═══════════════════════════════════════════════════════════════
 async def fetch_content_details_direct(
     session: aiohttp.ClientSession,
@@ -1556,96 +1751,78 @@ async def fetch_content_details_direct(
     course_id: int,
 ) -> dict | None:
     """
-    GET /course/content-details?content_id=X&course_id=Y
-    Returns the data dict or None.
+    Fetch content details via deltastudy.site API.
+
+    For PDFs  (file_type == 1): file_url is already in the response data.
+    For Videos (vdc_id is set): an additional video-details call is made to
+    resolve the real HLS file_url, which replaces the empty file_url in data.
+
+    Returns the enriched data dict or None.
     """
     try:
-        resp = await _direct_get(
-            session, platform, "/content-details",
-            params={"content_id": content_id, "course_id": course_id},
-        )
-
-        if resp.get("responseCode") == 3025:
-            raw_data = resp.get("data")
-            if not raw_data:
-                log.warning(
-                    f"[{platform}] content-details rc=3025 but no 'data' field for content_id={content_id}"
-                )
-                return None
-            try:
-                log.debug(
-                    f"[{platform}] decrypt.py invoking content_id={content_id} "
-                    f"raw_data_len={len(str(raw_data))}"
-                )
-                proc = await asyncio.create_subprocess_exec(
-                    "python", "decrypt.py", str(raw_data),
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                )
-                stdout, stderr = await proc.communicate()
-                stdout_text = stdout.decode(errors="ignore").strip()
-                stderr_text = stderr.decode(errors="ignore").strip()
-
-                if proc.returncode != 0:
-                    # exit codes from decrypt.py: 1=diagnosed decrypt/parse
-                    # failure, 2=bad invocation (argc), 3=unexpected error
-                    reason = {1: "diagnosed failure", 2: "bad invocation", 3: "unexpected error"}.get(
-                        proc.returncode, f"unknown exit code {proc.returncode}"
-                    )
-                    log.warning(
-                        f"[{platform}] decrypt.py failed content_id={content_id} "
-                        f"rc={proc.returncode} ({reason}): {stderr_text or '<no stderr>'}"
-                    )
-                    return None
-
-                if not stdout_text:
-                    log.warning(
-                        f"[{platform}] decrypt.py exited 0 but produced empty stdout "
-                        f"content_id={content_id} stderr={stderr_text or '<none>'}"
-                    )
-                    return None
-
-                try:
-                    detail = json.loads(stdout_text)
-                except json.JSONDecodeError as je:
-                    log.warning(
-                        f"[{platform}] decrypt.py stdout was not valid JSON "
-                        f"content_id={content_id}: {je}. "
-                        f"stdout_preview={stdout_text[:120]!r} stderr={stderr_text or '<none>'}"
-                    )
-                    return None
-            except Exception as e:
-                log.warning(f"[{platform}] decrypt.py invocation error content_id={content_id}: {e}")
-                return None
-
-            if detail:
-                log.debug(
-                    f"[{platform}] content-details (decrypted) OK content_id={content_id} "
-                    f"file_type={detail.get('file_type')} duration={detail.get('duration')!r} "
-                    f"file_url={'yes' if (detail.get('file_url') or '').strip() else 'NO'}"
-                )
-            else:
-                log.warning(
-                    f"[{platform}] decrypt.py returned no usable data for content_id={content_id}"
-                )
-            return detail
-
-        detail = resp.get("data") or None
+        detail = await fetch_delta_content_details(session, content_id, course_id)
         if detail is None:
             log.warning(
-                f"[{platform}] content-details returned no data for content_id={content_id} "
-                f"rc={resp.get('responseCode')} msg={resp.get('message','')}"
+                f"[{platform}] Delta content-details returned nothing for content_id={content_id}"
             )
-        else:
+            return None
+
+        vdc_id = (detail.get("vdc_id") or "").strip()
+        file_type = detail.get("file_type")
+
+        if vdc_id:
+            # ── Video: resolve real HLS URL via video-details ────────
             log.debug(
-                f"[{platform}] content-details OK content_id={content_id} "
-                f"file_type={detail.get('file_type')} duration={detail.get('duration')!r} "
-                f"file_url={'yes' if (detail.get('file_url') or '').strip() else 'NO'}"
+                f"[{platform}] content_id={content_id} has vdc_id={vdc_id!r} — "
+                "fetching video-details"
             )
+            video_data = await fetch_delta_video_details(session, vdc_id)
+            if video_data:
+                hls_url = (video_data.get("file_url") or "").strip()
+                if hls_url:
+                    detail["file_url"] = hls_url
+                    log.debug(
+                        f"[{platform}] content_id={content_id} video URL resolved: {hls_url[:60]}…"
+                    )
+                else:
+                    log.warning(
+                        f"[{platform}] content_id={content_id} vdc_id={vdc_id!r}: "
+                        "video-details returned no file_url — will retry next run"
+                    )
+            else:
+                log.warning(
+                    f"[{platform}] content_id={content_id} vdc_id={vdc_id!r}: "
+                    "video-details returned no data — will retry next run"
+                )
+                # Leave file_url as-is (probably empty); post_content will skip it
+        else:
+            # ── PDF: file_url is already in the response ─────────────
+            file_url = (detail.get("file_url") or "").strip()
+            log.debug(
+                f"[{platform}] content_id={content_id} PDF file_type={file_type} "
+                f"file_url={'yes' if file_url else 'NO'}"
+            )
+
         return detail
+
     except Exception as e:
         log.warning(f"[{platform}] content-details failed content_id={content_id}: {e}")
         return None
+
+
+# ── LEGACY STUB kept so nothing else breaks ─────────────────────
+# (was: fetch_content_details_direct using course.nexttoppers.com + decrypt.py)
+# The body below is intentionally unreachable; real logic is above.
+def _LEGACY_fetch_content_details_direct_UNREACHABLE(  # noqa: N802
+    session, platform, content_id, course_id,
+):  # pragma: no cover
+    """
+    Old implementation that hit course.nexttoppers.com/course/content-details
+    and passed the encrypted response through decrypt.py.
+    Kept here as a reference for the decrypt.py integration.
+    """
+    # (body omitted — superseded by Delta API above)
+    pass
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -1721,9 +1898,98 @@ async def get_content_detail(
 ):
     """
     Return the content detail dict for a file item.
-    Uses inline data if it already has a usable file_url; otherwise
-    calls the direct content-details endpoint.
+
+    Routing logic (based on content_type in the inline all-content data):
+
+    • content_type == 1  (PDF / file):
+        Call Delta content-details → file_url is already in the response.
+
+    • content_type == 2  (Video):
+        Skip content-details entirely.  Use vdc_id from the inline all-content
+        data to call video-details directly, then merge the remaining fields
+        (id, file_type, thumbnail, duration, download_urls, vdc_id, etc.)
+        from the inline data so the returned dict is identical in shape to
+        what fetch_content_details_direct would have produced.
+
+    • content_type unknown / inline_data missing:
+        Fall back to the normal Delta content-details path (safe default).
     """
+    inline = inline_data or {}
+    content_type = inline.get("content_type")
+
+    # ── content_type 2: Video — skip content-details, go straight to video-details ──
+    if content_type == 2:
+        vdc_id = (inline.get("vdc_id") or "").strip()
+        if not vdc_id:
+            log.warning(
+                f"[{platform}] content_id={content_id} content_type=2 but no vdc_id in "
+                "inline data — falling back to content-details"
+            )
+            return await fetch_content_details_direct(session, platform, content_id, course_id)
+
+        log.debug(
+            f"[{platform}] content_id={content_id} content_type=2 vdc_id={vdc_id!r} — "
+            "fetching video-details directly (skipping content-details)"
+        )
+        video_data = await fetch_delta_video_details(session, vdc_id)
+        if video_data is None:
+            log.warning(
+                f"[{platform}] content_id={content_id} vdc_id={vdc_id!r}: "
+                "video-details failed — falling back to content-details"
+            )
+            return await fetch_content_details_direct(session, platform, content_id, course_id)
+
+        hls_url = (video_data.get("file_url") or "").strip()
+        if not hls_url:
+            log.warning(
+                f"[{platform}] content_id={content_id} vdc_id={vdc_id!r}: "
+                "video-details returned no file_url — will retry next run"
+            )
+            # Return a merged dict anyway; post_content will skip it (no file_url).
+
+        # Build a detail dict in the same shape as content-details would return,
+        # preferring video_data values but filling gaps from inline all-content data.
+        detail = {
+            "id":            inline.get("id", content_id),
+            "vdc_id":        vdc_id,
+            "file_type":     inline.get("file_type", 2),
+            "content_type":  2,
+            "file_url":      hls_url,
+            "thumbnail":     video_data.get("thumbnail") or inline.get("thumbnail", ""),
+            "duration":      video_data.get("duration") or inline.get("duration", 0),
+            "is_drm":        inline.get("is_drm", 0),
+            "is_live":       inline.get("is_live", 0),
+            "is_download":   inline.get("is_download", 0),
+            "download_urls": inline.get("download_urls"),
+            "video_type":    inline.get("video_type", 0),
+            "in_app":        inline.get("in_app", 0),
+            "is_share":      inline.get("is_share", 0),
+            "has_pdf":       inline.get("has_pdf", "0"),
+            "description":   inline.get("description"),
+            "is_locked":     inline.get("is_locked", 0),
+            "is_purchased":  inline.get("is_purchased", 0),
+            "dynamic_link":  inline.get("dynamic_link", ""),
+            "mark_as_complete": inline.get("mark_as_complete", 0),
+            "rating":        inline.get("rating", "0.0"),
+        }
+        log.debug(
+            f"[{platform}] content_id={content_id} video-details merged; "
+            f"file_url={'yes' if hls_url else 'NO'}"
+        )
+        return detail
+
+    # ── content_type 1 (PDF) or unknown: use Delta content-details ──
+    if content_type == 1:
+        log.debug(
+            f"[{platform}] content_id={content_id} content_type=1 (PDF) — "
+            "fetching content-details from Delta"
+        )
+    else:
+        log.debug(
+            f"[{platform}] content_id={content_id} content_type={content_type!r} (unknown) — "
+            "falling back to content-details from Delta"
+        )
+
     return await fetch_content_details_direct(session, platform, content_id, course_id)
 
 
@@ -1739,7 +2005,13 @@ async def post_content(app: Application, platform, channel_id, detail, title):
     if not file_url:
         return False
 
-    is_video = (file_type == 2) or bool(detail.get("video_type"))
+    # Delta API: videos have a non-empty vdc_id; PDFs have file_type == 1.
+    # Fall back to file_type == 2 / video_type for any legacy data.
+    is_video = (
+        bool((detail.get("vdc_id") or "").strip())
+        or (file_type == 2)
+        or bool(detail.get("video_type"))
+    )
 
     # ── Skip videos with zero / missing duration (not yet processed by platform) ──
     if is_video:
