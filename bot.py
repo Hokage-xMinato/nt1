@@ -73,6 +73,7 @@ AUTH_API_URL = "https://nt-bearer.vercel.app/api"
 # ── Delta Study cookie API ──────────────────────────────────────
 DELTA_COOKIE_API  = "https://deltacookie.vercel.app/api/cookie"
 DELTA_API_BASE    = "https://apiserver.deltastudy.site/api/nexttoppers"
+DELTA_MJ_API_BASE = "https://apiserver.deltastudy.site/api/missionjeet"
 
 # In-memory delta cookie cache  { "cookie": "delta_cf_verified=…", "expires_at": datetime }
 _delta_cookie_cache: dict = {}
@@ -707,6 +708,102 @@ async def fetch_delta_video_details(
     return data if data else None
 
 
+async def _delta_get_mj(
+    session: aiohttp.ClientSession, path: str, params: dict
+) -> dict | None:
+    """
+    GET https://apiserver.deltastudy.site/api/missionjeet/<path> with delta cookie.
+    Identical retry / cookie-refresh logic to _delta_get but uses DELTA_MJ_API_BASE.
+    """
+    url = f"{DELTA_MJ_API_BASE}/{path}"
+    for attempt in range(1, 4):
+        try:
+            cookie = await _get_delta_cookie(session)
+            headers = _delta_headers(cookie)
+            async with session.get(
+                url, params=params, headers=headers,
+                timeout=aiohttp.ClientTimeout(total=30),
+            ) as r:
+                if r.status == 403:
+                    log.warning(
+                        f"_delta_get_mj {path} attempt {attempt}/3: 403 — refreshing cookie"
+                    )
+                    _delta_cookie_cache.clear()
+                    if attempt < 3:
+                        await asyncio.sleep(1)
+                        continue
+                    log.error(f"_delta_get_mj {path}: still 403 after cookie refresh")
+                    return None
+                if r.status != 200:
+                    log.warning(f"_delta_get_mj {path} attempt {attempt}/3: HTTP {r.status}")
+                    if attempt < 3:
+                        await asyncio.sleep(2 ** attempt)
+                        continue
+                    return None
+                data = await r.json(content_type=None)
+                return data
+        except Exception as e:
+            log.warning(f"_delta_get_mj {path} attempt {attempt}/3: {e}")
+            if attempt < 3:
+                await asyncio.sleep(2 ** attempt)
+    return None
+
+
+# ─── MissionJeet-specific Delta fetchers ───────────────────────
+async def fetch_mj_content_details(
+    session: aiohttp.ClientSession,
+    content_id: int,
+    course_id: int,
+) -> dict | None:
+    """
+    Fetch content details for MissionJeet from deltastudy.site.
+    Endpoint: GET /api/missionjeet/content-details?content_id=X&course_id=Y
+    Returns the 'data' dict from the response, or None.
+    """
+    resp = await _delta_get_mj(
+        session,
+        "content-details",
+        params={"content_id": content_id, "course_id": course_id},
+    )
+    if resp is None:
+        return None
+    if not resp.get("success"):
+        log.warning(
+            f"fetch_mj_content_details: content_id={content_id} "
+            f"success=false msg={resp.get('message','')}"
+        )
+        return None
+    return resp.get("data")
+
+
+async def fetch_mj_video_details(
+    session: aiohttp.ClientSession,
+    content_id: int,
+    course_id: int,
+    folder_id: int,
+) -> dict | None:
+    """
+    Fetch video details for MissionJeet from deltastudy.site.
+    Endpoint: GET /api/missionjeet/video-details?content_id=X&course_id=Y&folder_id=Z
+    Returns the full 'data' dict (file_url, duration, thumbnail, etc.), or None.
+    """
+    resp = await _delta_get_mj(
+        session,
+        "video-details",
+        params={"content_id": content_id, "course_id": course_id, "folder_id": folder_id},
+    )
+    if resp is None:
+        return None
+    if not resp.get("success"):
+        log.warning(
+            f"fetch_mj_video_details: content_id={content_id} course_id={course_id} "
+            f"folder_id={folder_id} success=false msg={resp.get('message','')}"
+        )
+        return None
+    data = resp.get("data") or {}
+    return data if data else None
+
+
 async def _direct_post(session: aiohttp.ClientSession, platform: str, path: str, body: dict) -> dict:
     """POST to course.nexttoppers.com with proper headers and retry logic.
     On 401/403 automatically refreshes the auth token once and retries."""
@@ -1146,7 +1243,9 @@ async def _do_forceall(status_fn, app: Application):
                         continue
 
                     detail = await get_content_detail(
-                        session, platform, content_id, course_id, f.get("data")
+                        session, platform, content_id, course_id,
+                        inline_data=f.get("data"),
+                        folder_id=int(f.get("parent_id") or 0),
                     )
                     if detail is None:
                         log.warning(
@@ -1578,7 +1677,9 @@ async def cb_forceupdate(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     continue
 
                 detail = await get_content_detail(
-                    session, platform, content_id, course_id, f.get("data")
+                    session, platform, content_id, course_id,
+                    inline_data=f.get("data"),
+                    folder_id=int(f.get("parent_id") or 0),
                 )
                 if detail is None:
                     log.warning(
@@ -1749,18 +1850,26 @@ async def fetch_content_details_direct(
     platform: str,
     content_id: int,
     course_id: int,
+    folder_id: int = 0,
 ) -> dict | None:
     """
     Fetch content details via deltastudy.site API.
 
-    For PDFs  (file_type == 1): file_url is already in the response data.
-    For Videos (vdc_id is set): an additional video-details call is made to
-    resolve the real HLS file_url, which replaces the empty file_url in data.
+    NT  → /api/nexttoppers/content-details?content_id=X&courseid=Y
+          then /api/nexttoppers/video-details?videoid=<vdc_id>  if video.
+
+    MJ  → /api/missionjeet/content-details?content_id=X&course_id=Y
+          then /api/missionjeet/video-details?content_id=X&course_id=Y&folder_id=Z  if video.
 
     Returns the enriched data dict or None.
     """
     try:
-        detail = await fetch_delta_content_details(session, content_id, course_id)
+        # ── Fetch content-details (platform-aware) ───────────────────
+        if platform == "mj":
+            detail = await fetch_mj_content_details(session, content_id, course_id)
+        else:
+            detail = await fetch_delta_content_details(session, content_id, course_id)
+
         if detail is None:
             log.warning(
                 f"[{platform}] Delta content-details returned nothing for content_id={content_id}"
@@ -1771,12 +1880,18 @@ async def fetch_content_details_direct(
         file_type = detail.get("file_type")
 
         if vdc_id:
-            # ── Video: resolve real HLS URL via video-details ────────
+            # ── Video: resolve real HLS URL via video-details (platform-aware) ──
             log.debug(
                 f"[{platform}] content_id={content_id} has vdc_id={vdc_id!r} — "
                 "fetching video-details"
             )
-            video_data = await fetch_delta_video_details(session, vdc_id)
+            if platform == "mj":
+                video_data = await fetch_mj_video_details(
+                    session, content_id, course_id, folder_id
+                )
+            else:
+                video_data = await fetch_delta_video_details(session, vdc_id)
+
             if video_data:
                 hls_url = (video_data.get("file_url") or "").strip()
                 if hls_url:
@@ -1786,15 +1901,14 @@ async def fetch_content_details_direct(
                     )
                 else:
                     log.warning(
-                        f"[{platform}] content_id={content_id} vdc_id={vdc_id!r}: "
+                        f"[{platform}] content_id={content_id}: "
                         "video-details returned no file_url — will retry next run"
                     )
             else:
                 log.warning(
-                    f"[{platform}] content_id={content_id} vdc_id={vdc_id!r}: "
+                    f"[{platform}] content_id={content_id}: "
                     "video-details returned no data — will retry next run"
                 )
-                # Leave file_url as-is (probably empty); post_content will skip it
         else:
             # ── PDF: file_url is already in the response ─────────────
             file_url = (detail.get("file_url") or "").strip()
@@ -1894,7 +2008,9 @@ async def fetch_files_recursive(
 #  CONTENT DETAIL RESOLVER
 # ═══════════════════════════════════════════════════════════════
 async def get_content_detail(
-    session, platform, content_id, course_id, inline_data: dict | None = None
+    session, platform, content_id, course_id,
+    inline_data: dict | None = None,
+    folder_id: int = 0,
 ):
     """
     Return the content detail dict for a file item.
@@ -1902,75 +2018,105 @@ async def get_content_detail(
     Routing logic (based on content_type in the inline all-content data):
 
     • content_type == 1  (PDF / file):
-        Call Delta content-details → file_url is already in the response.
+        NT & MJ → call platform-appropriate content-details endpoint.
+        file_url is already in the response.
 
     • content_type == 2  (Video):
-        Skip content-details entirely.  Use vdc_id from the inline all-content
-        data to call video-details directly, then merge the remaining fields
-        (id, file_type, thumbnail, duration, download_urls, vdc_id, etc.)
-        from the inline data so the returned dict is identical in shape to
-        what fetch_content_details_direct would have produced.
+        Skip content-details entirely and go straight to video-details.
+
+        NT  → fetch_delta_video_details(vdc_id)
+              vdc_id comes from inline_data["vdc_id"].
+
+        MJ  → fetch_mj_video_details(content_id, course_id, folder_id)
+              folder_id comes from the item's parent_id in the all-content list.
+
+        Fields not returned by video-details are filled from inline_data so the
+        returned dict has the same shape as a content-details response.
 
     • content_type unknown / inline_data missing:
-        Fall back to the normal Delta content-details path (safe default).
+        Fall back to the platform-appropriate content-details path (safe default).
     """
     inline = inline_data or {}
     content_type = inline.get("content_type")
 
     # ── content_type 2: Video — skip content-details, go straight to video-details ──
     if content_type == 2:
-        vdc_id = (inline.get("vdc_id") or "").strip()
-        if not vdc_id:
-            log.warning(
-                f"[{platform}] content_id={content_id} content_type=2 but no vdc_id in "
-                "inline data — falling back to content-details"
+        if platform == "mj":
+            # MJ: video-details takes content_id, course_id, folder_id (parent_id)
+            log.debug(
+                f"[mj] content_id={content_id} content_type=2 — "
+                f"fetching MJ video-details directly (folder_id={folder_id})"
             )
-            return await fetch_content_details_direct(session, platform, content_id, course_id)
-
-        log.debug(
-            f"[{platform}] content_id={content_id} content_type=2 vdc_id={vdc_id!r} — "
-            "fetching video-details directly (skipping content-details)"
-        )
-        video_data = await fetch_delta_video_details(session, vdc_id)
-        if video_data is None:
-            log.warning(
-                f"[{platform}] content_id={content_id} vdc_id={vdc_id!r}: "
-                "video-details failed — falling back to content-details"
+            video_data = await fetch_mj_video_details(
+                session, content_id, course_id, folder_id
             )
-            return await fetch_content_details_direct(session, platform, content_id, course_id)
+            if video_data is None:
+                log.warning(
+                    f"[mj] content_id={content_id}: MJ video-details failed — "
+                    "falling back to MJ content-details"
+                )
+                return await fetch_content_details_direct(
+                    session, platform, content_id, course_id, folder_id
+                )
+        else:
+            # NT: video-details takes vdc_id
+            vdc_id = (inline.get("vdc_id") or "").strip()
+            if not vdc_id:
+                log.warning(
+                    f"[{platform}] content_id={content_id} content_type=2 but no vdc_id in "
+                    "inline data — falling back to content-details"
+                )
+                return await fetch_content_details_direct(
+                    session, platform, content_id, course_id, folder_id
+                )
+            log.debug(
+                f"[{platform}] content_id={content_id} content_type=2 vdc_id={vdc_id!r} — "
+                "fetching NT video-details directly (skipping content-details)"
+            )
+            video_data = await fetch_delta_video_details(session, vdc_id)
+            if video_data is None:
+                log.warning(
+                    f"[{platform}] content_id={content_id} vdc_id={vdc_id!r}: "
+                    "video-details failed — falling back to content-details"
+                )
+                return await fetch_content_details_direct(
+                    session, platform, content_id, course_id, folder_id
+                )
 
         hls_url = (video_data.get("file_url") or "").strip()
         if not hls_url:
             log.warning(
-                f"[{platform}] content_id={content_id} vdc_id={vdc_id!r}: "
+                f"[{platform}] content_id={content_id}: "
                 "video-details returned no file_url — will retry next run"
             )
-            # Return a merged dict anyway; post_content will skip it (no file_url).
+            # Return merged dict anyway; post_content will skip it (no file_url).
+
+        vdc_id_val = inline.get("vdc_id", "") if platform != "mj" else ""
 
         # Build a detail dict in the same shape as content-details would return,
         # preferring video_data values but filling gaps from inline all-content data.
         detail = {
-            "id":            inline.get("id", content_id),
-            "vdc_id":        vdc_id,
-            "file_type":     inline.get("file_type", 2),
-            "content_type":  2,
-            "file_url":      hls_url,
-            "thumbnail":     video_data.get("thumbnail") or inline.get("thumbnail", ""),
-            "duration":      video_data.get("duration") or inline.get("duration", 0),
-            "is_drm":        inline.get("is_drm", 0),
-            "is_live":       inline.get("is_live", 0),
-            "is_download":   inline.get("is_download", 0),
-            "download_urls": inline.get("download_urls"),
-            "video_type":    inline.get("video_type", 0),
-            "in_app":        inline.get("in_app", 0),
-            "is_share":      inline.get("is_share", 0),
-            "has_pdf":       inline.get("has_pdf", "0"),
-            "description":   inline.get("description"),
-            "is_locked":     inline.get("is_locked", 0),
-            "is_purchased":  inline.get("is_purchased", 0),
-            "dynamic_link":  inline.get("dynamic_link", ""),
+            "id":               inline.get("id", content_id),
+            "vdc_id":           vdc_id_val,
+            "file_type":        inline.get("file_type", 2),
+            "content_type":     2,
+            "file_url":         hls_url,
+            "thumbnail":        video_data.get("thumbnail") or inline.get("thumbnail", ""),
+            "duration":         video_data.get("duration") or inline.get("duration", 0),
+            "is_drm":           inline.get("is_drm", 0),
+            "is_live":          inline.get("is_live", 0),
+            "is_download":      inline.get("is_download", 0),
+            "download_urls":    inline.get("download_urls"),
+            "video_type":       inline.get("video_type", 0),
+            "in_app":           inline.get("in_app", 0),
+            "is_share":         inline.get("is_share", 0),
+            "has_pdf":          inline.get("has_pdf", "0"),
+            "description":      inline.get("description"),
+            "is_locked":        inline.get("is_locked", 0),
+            "is_purchased":     inline.get("is_purchased", 0),
+            "dynamic_link":     inline.get("dynamic_link", ""),
             "mark_as_complete": inline.get("mark_as_complete", 0),
-            "rating":        inline.get("rating", "0.0"),
+            "rating":           inline.get("rating", "0.0"),
         }
         log.debug(
             f"[{platform}] content_id={content_id} video-details merged; "
@@ -1978,7 +2124,7 @@ async def get_content_detail(
         )
         return detail
 
-    # ── content_type 1 (PDF) or unknown: use Delta content-details ──
+    # ── content_type 1 (PDF) or unknown: use platform-appropriate content-details ──
     if content_type == 1:
         log.debug(
             f"[{platform}] content_id={content_id} content_type=1 (PDF) — "
@@ -1990,7 +2136,9 @@ async def get_content_detail(
             "falling back to content-details from Delta"
         )
 
-    return await fetch_content_details_direct(session, platform, content_id, course_id)
+    return await fetch_content_details_direct(
+        session, platform, content_id, course_id, folder_id
+    )
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -2131,7 +2279,9 @@ async def check_and_post(app: Application):
                         continue
 
                     detail = await get_content_detail(
-                        session, platform, content_id, course_id, f.get("data")
+                        session, platform, content_id, course_id,
+                        inline_data=f.get("data"),
+                        folder_id=int(f.get("parent_id") or 0),
                     )
                     if detail is None:
                         log.warning(
