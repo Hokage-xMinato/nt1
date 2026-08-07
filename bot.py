@@ -104,8 +104,8 @@ PLATFORMS = {
 # ═══════════════════════════════════════════════════════════════
 #  DATABASE  –  Aiven MySQL
 # ═══════════════════════════════════════════════════════════════
-_DB_HOST = "mysql-3369278f-cathycarter-c7c2.c.aivencloud.com"
-_DB_PORT = 11860
+_DB_HOST = "mysql-15f5ad4f-himanshu-dd3b.e.aivencloud.com"
+_DB_PORT = 21771
 _DB_USER = "avnadmin"
 _DB_DATABASE = "defaultdb"
 _CA_CERT_INLINE = os.getenv("AIVEN_CA_CERT", "").strip()
