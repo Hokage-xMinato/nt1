@@ -595,12 +595,12 @@ async def _get_delta_cookie(session: aiohttp.ClientSession | None = None) -> str
 
 
 def _delta_headers(cookie: str) -> dict:
-    """Build HTTP headers for apiserver.deltastudy.site requests."""
+    """Build HTTP headers for apiserver.deltastudy.fun requests."""
     return {
         "accept": "application/json, text/plain, */*",
         "cookie": cookie,
-        "origin": "https://deltastudy.site",
-        "referer": "https://deltastudy.site/",
+        "origin": "https://deltastudy.fun",
+        "referer": "https://deltastudy.fun/",
         "user-agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -613,7 +613,7 @@ async def _delta_get(
     session: aiohttp.ClientSession, path: str, params: dict
 ) -> dict | None:
     """
-    GET https://apiserver.deltastudy.site/api/nexttoppers/<path> with delta cookie.
+    GET https://apiserver.deltastudy.fun/api/nexttoppers/<path> with delta cookie.
     Auto-refreshes the cookie on 403 and retries once.
     Returns the parsed JSON dict, or None on failure.
     """
@@ -661,7 +661,7 @@ async def fetch_delta_content_details(
     course_id: int,
 ) -> dict | None:
     """
-    Fetch PDF / video content details from deltastudy.site.
+    Fetch PDF / video content details from deltastudy.fun.
     Endpoint: GET /api/nexttoppers/content-details?content_id=X&courseid=Y
     Returns the 'data' dict from the response, or None.
     """
@@ -686,7 +686,7 @@ async def fetch_delta_video_details(
     vdc_id: str,
 ) -> dict | None:
     """
-    Fetch video details from deltastudy.site.
+    Fetch video details from deltastudy.fun.
     Endpoint: GET /api/nexttoppers/video-details?videoid=<vdc_id>
     Returns the full 'data' dict (which contains file_url, duration,
     thumbnail, etc.), or None on failure.
@@ -712,7 +712,7 @@ async def _delta_get_mj(
     session: aiohttp.ClientSession, path: str, params: dict
 ) -> dict | None:
     """
-    GET https://apiserver.deltastudy.site/api/missionjeet/<path> with delta cookie.
+    GET https://apiserver.deltastudy.fun/api/missionjeet/<path> with delta cookie.
     Identical retry / cookie-refresh logic to _delta_get but uses DELTA_MJ_API_BASE.
     """
     url = f"{DELTA_MJ_API_BASE}/{path}"
@@ -756,7 +756,7 @@ async def fetch_mj_content_details(
     course_id: int,
 ) -> dict | None:
     """
-    Fetch content details for MissionJeet from deltastudy.site.
+    Fetch content details for MissionJeet from deltastudy.fun.
     Endpoint: GET /api/missionjeet/content-details?content_id=X&course_id=Y
     Returns the 'data' dict from the response, or None.
     """
@@ -783,7 +783,7 @@ async def fetch_mj_video_details(
     folder_id: int,
 ) -> dict | None:
     """
-    Fetch video details for MissionJeet from deltastudy.site.
+    Fetch video details for MissionJeet from deltastudy.fun.
     Endpoint: GET /api/missionjeet/video-details?content_id=X&course_id=Y&folder_id=Z
     Returns the full 'data' dict (file_url, duration, thumbnail, etc.), or None.
     """
@@ -1813,7 +1813,7 @@ async def msg_text_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 # ═══════════════════════════════════════════════════════════════
-#  DIRECT API – ALL-CONTENT  (POST to course.nexttoppers.com)
+#  DELTA API – ALL-CONTENT  (GET from apiserver.deltastudy.fun)
 # ═══════════════════════════════════════════════════════════════
 async def fetch_all_content(
     session: aiohttp.ClientSession,
@@ -1822,21 +1822,58 @@ async def fetch_all_content(
     folder_id: int = 0,
 ) -> list:
     """
-    POST /course/all-content with the correct body.
-    Returns the list of items from data[], or [].
+    Fetch course content list from the Delta Study all-content GET API.
+    Uses the platform-appropriate base URL (nexttoppers or missionjeet).
+
+    NT  → GET https://apiserver.deltastudy.fun/api/nexttoppers/all-content
+              ?course_id=X&folder_id=Y&is_free=&keyword=&limit=1000&page=1&parent_course_id=0
+
+    MJ  → GET https://apiserver.deltastudy.fun/api/missionjeet/all-content
+              ?course_id=X&folder_id=Y&is_free=&keyword=&limit=1000&page=1&parent_course_id=0
+
+    This API returns vdc_id and download_urls in the inline data, solving the
+    "no vdc_id in inline data" fallback issue that plagued the old direct POST path.
+
+    Returns the list of items from data[], or [] on failure.
     """
-    body = {
-        "course_id": str(course_id),
-        "folder_id": str(folder_id),
+    params = {
+        "course_id": course_id,
+        "folder_id": folder_id,
         "is_free": "",
         "keyword": "",
-        "limit": "1000",
-        "page": "1",
-        "parent_course_id": "0",
+        "limit": 1000,
+        "page": 1,
+        "parent_course_id": 0,
     }
+
+    # Choose the right Delta base URL for this platform
+    if platform == "mj":
+        base_url = DELTA_MJ_API_BASE
+        get_fn = _delta_get_mj
+    else:
+        base_url = DELTA_API_BASE
+        get_fn = _delta_get
+
     try:
-        resp = await _direct_post(session, platform, "/all-content", body)
-        return resp.get("data") or []
+        resp = await get_fn(session, "all-content", params=params)
+        if resp is None:
+            log.warning(
+                f"[{platform}] fetch_all_content: Delta returned None "
+                f"for course={course_id} folder={folder_id}"
+            )
+            return []
+        if not resp.get("success"):
+            log.warning(
+                f"[{platform}] fetch_all_content: success=false "
+                f"msg={resp.get('message','')} for course={course_id} folder={folder_id}"
+            )
+            return []
+        items = resp.get("data") or []
+        log.debug(
+            f"[{platform}] fetch_all_content: course={course_id} folder={folder_id} "
+            f"→ {len(items)} item(s)"
+        )
+        return items
     except Exception as e:
         log.warning(f"[{platform}] fetch_all_content course={course_id} folder={folder_id}: {e}")
         return []
@@ -1853,7 +1890,7 @@ async def fetch_content_details_direct(
     folder_id: int = 0,
 ) -> dict | None:
     """
-    Fetch content details via deltastudy.site API.
+    Fetch content details via deltastudy.fun API.
 
     NT  → /api/nexttoppers/content-details?content_id=X&courseid=Y
           then /api/nexttoppers/video-details?videoid=<vdc_id>  if video.
@@ -1940,67 +1977,150 @@ def _LEGACY_fetch_content_details_direct_UNREACHABLE(  # noqa: N802
 
 
 # ═══════════════════════════════════════════════════════════════
-#  RECURSIVE FOLDER TRAVERSAL  –  uses direct API now
+#  RECURSIVE FOLDER TRAVERSAL  –  Delta all-content GET API
 # ═══════════════════════════════════════════════════════════════
+def _item_looks_like_file(item: dict) -> bool:
+    """
+    Return True if an item with an unknown/missing 'type' field should be
+    treated as a file rather than a folder.
+
+    Heuristics (any one is sufficient):
+      • inline data has a non-empty vdc_id  → video file
+      • inline data has file_type 1 or 2    → pdf (1) or video (2)
+      • inline data has a non-empty file_url → already resolved file
+      • inline data has a non-null/non-empty download_urls field
+      • inline data has a duration field set to a positive int
+    We deliberately do NOT rely on file_url alone because the Delta
+    all-content API returns an empty file_url for videos (the real URL
+    only arrives later from video-details).
+    """
+    inline = item.get("data") or {}
+
+    if (inline.get("vdc_id") or "").strip():
+        return True
+
+    ft = inline.get("file_type")
+    if ft in (1, 2):
+        return True
+
+    if (inline.get("file_url") or "").strip():
+        return True
+
+    dl = inline.get("download_urls")
+    if dl and dl not in ('""', "null", "", "[]"):
+        return True
+
+    try:
+        if int(inline.get("duration") or 0) > 0:
+            return True
+    except (ValueError, TypeError):
+        pass
+
+    return False
+
+
 async def fetch_files_recursive(
     session, platform, course_id, folder_id=0, _depth=0
 ):
     """
-    Recursively walk the course content tree via direct API calls.
-    folder_id=0 for the root; recurse with the entity_id of each folder.
+    Recursively walk the course content tree via the Delta all-content GET API.
+
+    Handles every real-world layout:
+      • Root level can contain both files (video/PDF) AND folders simultaneously.
+      • A folder at any depth can contain a mix of files (video + PDF) AND
+        nested sub-folders in the same response — all are collected correctly.
+      • Items with type="file"   → collected immediately (video or PDF, both fine).
+      • Items with type="folder" → recursed into; their files are collected.
+      • Items with missing/unknown type → classified by inline data heuristics
+        (_item_looks_like_file) before deciding to collect or recurse, so a
+        video with empty file_url is never misidentified as a folder.
     """
     if _depth > 15:
-        log.warning(f"[{platform}] Max recursion depth hit for course {course_id} folder {folder_id}")
+        log.warning(
+            f"[{platform}] Max recursion depth reached for course {course_id} "
+            f"folder {folder_id} — stopping here"
+        )
         return []
 
     items = await fetch_all_content(session, platform, course_id, folder_id)
-    log.debug(f"[{platform}] depth={_depth} folder={folder_id} → {len(items)} item(s)")
+    log.debug(
+        f"[{platform}] depth={_depth} folder={folder_id} → {len(items)} raw item(s)"
+    )
 
     result = []
     for item in items:
         itype = (item.get("type") or "").lower().strip()
         entity_id = item.get("entity_id")
 
+        # ── Explicit folder ──────────────────────────────────────────
         if itype == "folder":
             if not entity_id:
-                log.warning(f"[{platform}] folder item has no entity_id, skipping: {item}")
+                log.warning(
+                    f"[{platform}] folder item missing entity_id at depth={_depth}, skipping"
+                )
                 continue
-            log.debug(f"[{platform}] descending folder entity_id={entity_id} depth={_depth}")
+            log.debug(
+                f"[{platform}] descending into folder entity_id={entity_id} depth={_depth}"
+            )
             sub = await fetch_files_recursive(
                 session, platform, course_id, entity_id, _depth=_depth + 1
             )
             result.extend(sub)
 
+        # ── Explicit file (video OR pdf — handled identically here) ──
         elif itype == "file":
             if not entity_id:
-                log.warning(f"[{platform}] file item has no entity_id, skipping: {item}")
+                log.warning(
+                    f"[{platform}] file item missing entity_id at depth={_depth}, skipping"
+                )
                 continue
+            inline = item.get("data") or {}
+            ct = inline.get("content_type")
+            ft = inline.get("file_type")
+            log.debug(
+                f"[{platform}] file entity_id={entity_id} "
+                f"content_type={ct} file_type={ft} depth={_depth}"
+            )
             result.append(item)
 
+        # ── Unknown / missing type ───────────────────────────────────
         else:
-            # Unknown / missing type
             if not entity_id:
-                log.debug(f"[{platform}] item has no type and no entity_id, skipping: {item}")
+                log.debug(
+                    f"[{platform}] item has no type and no entity_id at depth={_depth}, skipping"
+                )
                 continue
 
-            inline_data = item.get("data") or {}
-            has_file_url = bool((inline_data.get("file_url") or "").strip())
-
-            if has_file_url:
-                log.debug(f"[{platform}] unknown-type entity_id={entity_id} has inline file_url → file")
+            if _item_looks_like_file(item):
+                log.debug(
+                    f"[{platform}] unknown-type entity_id={entity_id} "
+                    "identified as file via inline data heuristics → collecting"
+                )
                 result.append(item)
             else:
-                log.debug(f"[{platform}] unknown-type entity_id={entity_id} → attempting folder recursion")
+                # Might be a folder with no explicit type — try recursing
+                log.debug(
+                    f"[{platform}] unknown-type entity_id={entity_id} "
+                    "no file signals found → attempting folder recursion"
+                )
                 sub = await fetch_files_recursive(
                     session, platform, course_id, entity_id, _depth=_depth + 1
                 )
                 if sub:
                     result.extend(sub)
                 else:
-                    log.debug(f"[{platform}] entity_id={entity_id} yielded no children → treating as file")
+                    # Recursion returned nothing: treat as a leaf file so it
+                    # at least surfaces for content-detail resolution later.
+                    log.debug(
+                        f"[{platform}] entity_id={entity_id} yielded no children "
+                        "→ treating as leaf file"
+                    )
                     result.append(item)
 
-    log.info(f"[{platform}] depth={_depth} folder={folder_id} → {len(result)} file(s) after recursion")
+    log.info(
+        f"[{platform}] depth={_depth} folder={folder_id} "
+        f"→ {len(result)} file(s) collected after full traversal"
+    )
     return result
 
 
