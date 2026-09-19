@@ -72,8 +72,8 @@ AUTH_API_URL = "https://nt-bearer.vercel.app/api"
 
 # ── Delta Study cookie API ──────────────────────────────────────
 DELTA_COOKIE_API  = "https://deltacookie.vercel.app/api/cookie"
-DELTA_API_BASE    = "https://www.learnxpw.site/api/nexttoppers"
-DELTA_MJ_API_BASE = "https://www.learnxpw.site/api/missionjeet"
+DELTA_API_BASE    = "https://apiserver.deltastudy.fun/api/nexttoppers"
+DELTA_MJ_API_BASE = "https://apiserver.deltastudy.fun/api/missionjeet"
 
 # In-memory delta cookie cache  { "cookie": "delta_cf_verified=…", "expires_at": datetime }
 _delta_cookie_cache: dict = {}
